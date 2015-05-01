@@ -1,0 +1,115 @@
+#!/usr/bin/perl
+
+# Enable warnings.
+use strict;
+use warnings;
+
+# Initialize modules.
+use Math::BigInt;
+
+# Declare prototypes.
+sub parse_ddrescue_logfile ($);
+sub generate_dmsetup ($$$);
+
+# Parse ddrescue logfile.
+sub parse_ddrescue_logfile ($) {
+   my ($ddrescue_logfile) = @_;
+
+   # Localize $_ variable.
+   local $_;
+
+   # Finished areas.
+   my $finished_areas = [];
+
+   # Regex matching integer constant in hexadecimal, decimal or octal format.
+   my $int_regex = qr/(?i:0x[0-9a-f]+|[1-9][0-9]*|0[0-7]*)/;
+
+   # Open ddrescue logfile.
+   open my $LOGFILE, "<", $ddrescue_logfile or die "$ddrescue_logfile: $!\n";
+
+   # Maximum size of disk.
+   my $max;
+
+   # Read ddrescue logfile.
+   while (<$LOGFILE>) {
+      # Skip comments and status line.
+      next if /^\s*#/ or /^$int_regex\s+\S\s*$/;
+
+      # Parse data block status entries.
+      my ($offset, $size, $status) = /^($int_regex)\s+($int_regex)\s+(\S)\s*$/ or die "$ddrescue_logfile: Parse error at line $.!\n$_";
+
+      # Convert integers from strings to Math::BigInt objects.
+      $_ = /^(?:0x|[1-9])/i ? Math::BigInt->new($_) : Math::BigInt->from_oct($_) for $offset, $size;
+
+      # Divide offset and size by 512.
+      $_->bdiv(512) for $offset, $size;
+
+      # Save finished areas.
+      push @{$finished_areas}, [$offset, $size] if $status eq "+";
+
+      # Save maximum size.
+      $max = $offset->copy()->badd($size);
+   }
+
+   # Close ddrescue logfile.
+   close $LOGFILE or die "$ddrescue_logfile: $!\n";
+
+   # Return list of finished areas.
+   return $finished_areas, $max;
+}
+
+# Generate dmsetup configuration table.
+sub generate_dmsetup ($$$) {
+   my ($device_name, $finished_areas, $max) = @_;
+
+   # Start at block zero.
+   my $start = Math::BigInt->bzero();
+
+   # Loop across finished areas.
+   foreach my $area (@{$finished_areas}) {
+      my ($offset, $size) = @{$area};
+
+      # Check if an error area is needed.
+      if ($start->bcmp($offset)) {
+         # Calculate size of error area.
+         my $err_size = $offset->copy()->bsub($start);
+
+         # Output error mapping for error area.
+         printf "$start $err_size error\n";
+
+         # Adjust starting position.
+         $start->badd($err_size);
+      }
+
+      # Output identity mapping for finished area.
+      print "$offset $size linear $device_name $offset\n";
+
+      # Adjust starting position.
+      $start->badd($size);
+   }
+
+   # Check if a final error area is needed.
+   if ($start->bcmp($max)) {
+      # Calculate size of error area.
+      my $err_size = $max->copy()->bsub($start);
+
+      # Output error mapping for error area.
+      printf "$start $err_size error\n";
+   }
+}
+
+# Get program name.
+(my $program = $0) =~ s/^.*\///;
+
+# Usage message.
+my $usage = "$program <ddrescue_logfile> [<device_name>]\n";
+
+# Get command-line arguments.
+my $ddrescue_logfile = shift @ARGV or die $usage;
+my $device_name = shift @ARGV || "/dev/loop1";
+
+# Parse ddrescue logfile.
+my($finished_areas, $max) = parse_ddrescue_logfile $ddrescue_logfile;
+
+# Generate dmsetup configuration table.
+generate_dmsetup $device_name, $finished_areas, $max;
